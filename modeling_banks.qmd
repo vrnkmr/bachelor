@@ -1,0 +1,505 @@
+---
+title: "modeling_banks"
+format: html
+editor: visual
+---
+# Імпортуємо потрібні бібліотеки
+
+```{r}
+#| warning: false
+#| message: false
+library(forecast)
+library(dplyr)
+library(tsibble)
+library(stringi)
+library(tidyverse)
+library(GGally)
+library(factoextra)
+library(openxlsx)
+library(fpp3)
+library(corrplot)
+```
+# Пілготовка даних
+
+```{r}
+#| warning: false
+#| message: false
+banks<- readxl::read_xlsx('banks_new2.xlsx')
+
+remove <- c('АТ "БАНК СІЧ"', 'АТ "КБ "ЗЕМЕЛЬНИЙ КАПІТАЛ"', 'АТ "МЕГАБАНК"', 'АТ "МР БАНК" *', 'АТ "Місто Банк"', 'АТ "СБЕРБАНК"', 'АТ "УКРСОЦБАНК"', 'АТ АКБ "АРКАДА"', 'ПАТ "Промінвестбанк"', 'ПАТ "РОЗРАХУНКОВИЙ ЦЕНТР"')
+banks <- banks[!grepl(paste(remove, collapse = '|'), banks$name),]
+
+banks$group <- ifelse(grepl("з державною часткою", banks$group), "state",
+                      ifelse(grepl("іноземних банківських груп", banks$group), "foreign",
+                             ifelse(grepl("з приватним капіталом", banks$group), "privat", banks$group)))
+
+banks$name <- gsub(" ", "_", banks$name)
+banks$deposit_loans <- ifelse(is.na(banks$deposit_loans), 0, banks$deposit_loans)
+banks$rating6 <- banks$current_ratio+banks$capital_adequacy+banks$deposit_loans+banks$roa+banks$roe+banks$icr
+banks$date <- as.Date(banks$date)
+banks_rating <- banks %>% select(date, name, group, current_ratio, capital_adequacy, deposit_loans, roa, roe, icr, rating6)
+
+```
+
+```{r}
+banks_rating$date <- yearmonth(banks_rating$date)
+banks_rating_ts <- banks_rating %>% 
+  as_tsibble(index = date, key = name)
+banks_rating_ts
+```
+
+# Моделювання
+
+Побудуємо аріма моделі для державного банку АТ_КБ\_"ПриватБанк", що входив до аномального кластеру через велике значення надійності та для банку з іноземним капіталом АТ\_"Райффайзен_Банк", що входив до середнього кластеру надійності.
+
+Для побудові моделей дані необхідно перевести у стаціонарний вигляд(постійна дисперсія, відсутність сезонності)
+
+Стаціонарний ряд - постійне мат сподівання, постійна дисперсія, постійна коваріація. І - інтегрування - відповідає за приведення до стаціонарності
+
+## Візуалізація
+
+```{r}
+#| warning: false
+#| message: false
+ggplot(data = banks_rating_ts %>% filter(name == 'АТ_КБ_"ПриватБанк"'), aes(x = date, y = rating6)) +
+  geom_smooth(se = FALSE, colour = "lightblue") +
+  geom_line(colour = "blue") +
+  facet_wrap(vars(name), scales = "free") +
+  theme(legend.position = "none") +
+  labs(
+    title = "Рейтинг Приват банку"
+  )
+```
+
+Ряд не дуже схожий на стаціонарний, дисперсія є не дуже постійною, присутні різкі коливання
+
+
+
+# Графік кореляцій
+
+```{r}
+banks_rating_ts %>% 
+  filter(name == 'АТ_КБ_"ПриватБанк"') %>% 
+  ACF(rating6, lag_max = 21) %>%
+  autoplot() +
+  labs(
+    title = "Корелограма автокореляції ПриватБанк"
+  )
+```
+
+Автокреляції не виходять за межі довірчих інтервалів, отже ряд схожий на білий шум. Ймовірно не треба проводити диференціювання
+
+```{r}
+bank_ts_priv <- banks_rating_ts%>% 
+  select(date, name, rating6) %>% 
+  filter(name == 'АТ_КБ_"ПриватБанк"') %>% 
+  as_tsibble()
+```
+## kpss тест
+
+```{r}
+bank_ts_priv %>%
+  features(rating6, unitroot_kpss)
+```
+
+pvalue = 0,1 \> 0,05, тобто дані є стаціонарними та несезонними
+
+```{r}
+bank_ts_priv %>%
+  features(rating6, unitroot_ndiffs)
+```
+Так як дані виявились стаціонарними. За результатом KPSS тесту не потрібно використовувати ряд різниць
+
+# Бокс-кокс
+Допомогає зробити математичні перетворення часових рядів більш гнучкими. Задача в тому, щоб підібрати оптимальне значення лямбди. Чим менше дисперсія часового ряду, тим більш підходящою є лямбда.
+
+```{r}
+bank_ts_priv %>%
+  features(rating6, features = guerrero)
+```
+Саме це значення Лямбда буде оптимальним та буде врівноважувати сезонні коливання та випадкові міни у часовому ряді.
+
+```{r}
+bank_ts_priv %>% autoplot(box_cox(rating6, -0.8999268)) +
+  labs(y = "Box-Cox transformed rating6")+
+  geom_smooth(se=FALSE, colour="blue")
+```
+
+Суттєвих змін у графіку рейтингування ПриватБанку не відбудося після застосування тесту Бокса Кокса. Можна помітити тільки, що значення розмірності рейтингу зменшились. Але, на мою думку, це не зробило часовий ряд кращим для прогнозування. Навпаки інтерпритація даних тепер стала складнішою. Тому я вважаю, що використовувати тест Бокса Кокса недоцільно.
+
+# Декомпозиція часовового ряду
+
+```{r}
+dcmp_priv <- bank_ts_priv %>%
+  model(stl = STL(rating6))
+components(dcmp_priv)
+```
+
+STL-модель розклала часовий ряд на тренд, річну сезонність, залишки та сезонно скоригований ряд
+
+```{r}
+components(dcmp_priv) %>% gg_subseries(season_year)
+```
+Очевидно за STL декомпозицією присутня певна сезонність. Тобто у квітні кожного року значення рейтингу найменше, потім воно поступово починає рости і до січня набиріє максимальних результатів.
+
+# Графік сезонності
+
+```{r}
+banks_rating_ts %>% 
+  filter(name == 'АТ_КБ_"ПриватБанк"') %>% 
+  gg_season(rating6, labels = "both") +
+  labs(
+    title = "Сезонність ПриватБанк"
+  )
+```
+
+Кожного разу рейтинг Приват Банку трохи падав до квітня кожного року, але потім знову починав рости і до кінця року ставав навіть бішим, ніж на початку. Щодо зміни значення рейтингу Приват Банку на початку 2022 та на початку 2023 року, можна помітити, що воно стало навіть більше. Тобто це свідчить про те, що війна не вплинула негативно на надійність Приват Банку.
+
+```{r}
+bank_ts_priv %>%
+  model(STL(rating6, robust=TRUE)) %>%
+  components() %>% autoplot() +
+    labs(title = "STL декомпозиція: ПриватБанк рейтинг")
+```
+
+# Моделювання 
+
+```{r}
+fit_priv <- bank_ts_priv %>% 
+  model(arima = ARIMA(rating6),
+        ets = ETS(rating6),
+        stl = decomposition_model(STL(rating6 ~ trend(window=4), robust = TRUE), NAIVE(season_adjust)))
+```
+
+```{r}
+fabletools::accuracy(fit_priv) %>% select(name, .model, .type, RMSE)
+```
+
+Найкраще для даного часового ряду буде працювати авторегресійна модель другого порядку.
+
+$$ y_{t} = 0,82y_{y-1}-0,5y_{y-2}+\varepsilon _{t}$$, де $\varepsilon _{t}$ - це білий шум зі стандартним відхиленням $\sqrt{0,2067}=0,45$
+
+Інформаційний критерій достатньо маленький, що вказує на те, що модель непогана, але для Райфайзен банку модель спрацювала краще, адже там вони від'ємні
+
+
+```{r}
+fit_priv %>% select(arima) %>% report()
+```
+
+```{r}
+fit_priv %>% select(ets) %>% report()
+```
+```{r}
+fit_priv %>% select(stl) %>% print()
+```
+
+```{r}
+gg_tsresiduals(fit_priv %>% select(arima))
+```
+Маємо графік залишків, корелограму автокореляції та розподіл залишків.
+В цілому залишки виглядають як білий шум, підрядковуються нормальному розподілу. Тому Це може свідчити про те, що вони сильно не впливають на модель та її можна використовувати для прогнозування.
+```{r}
+gg_tsresiduals(fit_priv %>% select(ets))
+```
+
+Також гарна картинка. Автокореляція трохи менша. 
+
+```{r}
+gg_tsresiduals(fit_priv %>% select(stl))
+```
+
+```{r}
+bank_ts_priv %>%
+  model(stl = decomposition_model(
+    STL(rating6 ~ trend(window = 4), robust = TRUE),
+    NAIVE(season_adjust))) %>%
+  forecast()
+```
+
+
+```{r}
+bank_ts_priv %>%
+  model(stlf = decomposition_model(
+    STL(rating6 ~ trend(window = 4), robust = TRUE),
+    NAIVE(season_adjust))) %>%
+  forecast() %>%
+  autoplot(bank_ts_priv)+ 
+  xlab("Час") + 
+  ylab("Рейтинг") + 
+  ggtitle('Прогнозовані значення рейтингу АТ КБ "ПриватБанк" stl')
+  
+```
+```{r}
+arima_model_priv <- auto.arima(bank_ts_priv$rating6)
+forecast_values_priv <- forecast(arima_model_priv, h = 8)
+forecast_values_priv
+autoplot(forecast_values_priv) + 
+  xlab("Час") + 
+  ylab("Рейтинг") + 
+  ggtitle('Прогнозовані значення рейтингу АТ_КБ_"ПриватБанк" arima')
+```
+# Райффайзен Банк
+
+```{r}
+#| warning: false
+#| message: false
+ggplot(data = banks_rating_ts %>% filter(name == 'АТ_"Райффайзен_Банк"'), aes(x = date, y = rating6)) +
+  geom_smooth(se = FALSE, colour = "lightblue") +
+  geom_line(colour = "blue") +
+  facet_wrap(vars(name), scales = "free") +
+  theme(legend.position = "none") +
+  labs(
+    title = "Рейтинг Райффайзен Банку"
+  )
+```
+
+У двох випадках дисперсія є непостійною, присутні коливання з часом, не схожі на білий шум. Бачимо для Приват банку зростаючий тренд, можливо присутня сезонність для двох банків.
+
+
+
+# Графік кореляцій
+```{r}
+banks_rating_ts %>% 
+  filter(name == 'АТ_"Райффайзен_Банк"') %>% 
+  ACF(rating6, lag_max = 21) %>%
+  autoplot() +
+  labs(
+    title = "Корелограма автокореляції Райффайзен Банк"
+  )
+```
+
+Автокореляція відсутня
+
+```{r}
+bank_ts_raif <- banks_rating_ts %>% 
+  select(date, name, rating6) %>% 
+  filter(name == 'АТ_"Райффайзен_Банк"') %>% 
+  as_tsibble()
+```
+
+## kpss тест
+
+```{r}
+bank_ts_raif %>%
+  features(rating6, unitroot_kpss)
+```
+
+pvalue = 0,1 \> 0,05, тобто дані є стаціонарними та несезонними
+
+```{r}
+bank_ts_raif %>%
+  features(rating6, unitroot_ndiffs)
+```
+Так як дані виявились стаціонарними. За результатом KPSS тесту не потрібно використовувати ряд різниць
+```{r}
+bank_ts_raif %>%
+  features(rating6, features = guerrero)
+```
+Саме це значення Лямбда буде оптимальним та буде врівноважувати сезонні коливання та випадкові міни у часовому ряді.
+
+```{r}
+bank_ts_priv %>% autoplot(box_cox(rating6, -0.8999268)) +
+  labs(y = "Box-Cox transformed rating6")+
+  geom_smooth(se=FALSE, colour="blue")
+```
+# Сезонність
+
+```{r}
+banks_rating_ts %>% 
+  filter(name == 'АТ_"Райффайзен_Банк"') %>% 
+  gg_season(rating6, labels = "both") +
+  labs(
+    title = "Сезонність Райффайзен Банк"
+  )
+```
+
+Також присутня сезонність
+
+# Декомпозиція 
+```{r}
+bank_ts_raif %>%
+  model(STL(rating6, robust=TRUE)) %>%
+  components() %>% autoplot() +
+    labs(title = "STL декомпозиція: Райффайзен Банк рейтинг")
+```
+```{r}
+bank_ts_raif %>%
+  model(STL(rating6, robust=TRUE)) %>%
+```
+
+```{r}
+bank_ts_raif %>%
+  model(STL(rating6, robust=TRUE)) %>% components() %>% gg_subseries(season_year)
+```
+# Моделювання 
+
+```{r}
+fit_raif <- bank_ts_raif %>% 
+  model(arima = ARIMA(rating6),
+        ets = ETS(rating6),
+        stl = decomposition_model(STL(rating6 ~ trend(window=4), robust = TRUE), NAIVE(season_adjust)))
+```
+
+```{r}
+fabletools::accuracy(fit_raif) %>% select(name, .model, .type, RMSE)
+```
+
+```{r}
+fit_raif %>% select(arima) %>% report()
+
+```
+
+```{r}
+fit_raif %>% select(ets) %>% report()
+```
+## Залишки 
+
+```{r}
+gg_tsresiduals(fit_raif %>% select(arima))
+```
+
+```{r}
+gg_tsresiduals(fit_raif %>% select(ets))
+```
+
+```{r}
+gg_tsresiduals(fit_raif %>% select(stl))
+```
+
+```{r}
+bank_ts_raif %>%
+  model(arima = ARIMA(rating6)) %>%
+  fabletools::forecast() %>%
+  autoplot(bank_ts_raif)+ 
+  xlab("Час") + 
+  ylab("Рейтинг") + 
+  ggtitle('Прогнозовані значення рейтингу Райффайзен Банку ARIMA')
+  
+```
+
+# Львів
+
+```{r}
+#| warning: false
+#| message: false
+ggplot(data = banks_rating_ts %>% filter(name == 'АТ_АКБ_"Львів"'), aes(x = date, y = rating6)) +
+  geom_smooth(se = FALSE, colour = "lightblue") +
+  geom_line(colour = "blue") +
+  facet_wrap(vars(name), scales = "free") +
+  theme(legend.position = "none") +
+  labs(
+    title = "Рейтинг банку Львів"
+  )
+```
+
+
+
+
+
+# Графік кореляцій
+```{r}
+banks_rating_ts %>% 
+  filter(name == 'АТ_АКБ_"Львів"') %>% 
+  ACF(rating6, lag_max = 21) %>%
+  autoplot() +
+  labs(
+    title = 'Корелограма автокореляції АТ_АКБ_"Львів"'
+  )
+```
+
+
+```{r}
+bank_ts_lviv <- banks_rating_ts %>% 
+  select(date, name, rating6) %>% 
+  filter(name == 'АТ_АКБ_"Львів"') %>% 
+  as_tsibble()
+```
+
+## kpss тест
+
+```{r}
+bank_ts_lviv %>%
+  features(rating6, unitroot_kpss)
+```
+
+pvalue = 0.03 \< 0,05, тобто дані є нестаціонарними та сезонними
+
+```{r}
+bank_ts_lviv %>%
+  features(rating6, unitroot_ndiffs)
+```
+Так як дані виявились стаціонарними. За результатом KPSS тесту не потрібно використовувати ряд різниць
+
+```{r}
+bank_ts_lviv %>% ACF(difference(rating6)) %>% autoplot() + labs(
+    title = "Автокореляція перших різниць банку Львів")
+```
+
+# Сезонність
+
+```{r}
+bank_ts_lviv %>% 
+  gg_season(rating6, labels = "both") +
+  labs(
+    title = 'Сезонність АТ_АКБ_"Львів"'
+  )
+```
+
+Також присутня сезонність
+
+# Декомпозиція 
+```{r}
+bank_ts_lviv %>%
+  model(STL(rating6, robust=TRUE)) %>%
+  components() %>% autoplot() +
+    labs(title = 'STL декомпозиція: АТ_АКБ_"Львів" рейтинг')
+```
+```{r}
+bank_ts_lviv %>%
+  model(STL(rating6, robust=TRUE)) %>% components() %>% gg_subseries(season_year)
+```
+
+# Моделювання 
+
+```{r}
+fit_lviv <- bank_ts_lviv %>% 
+  model(arima = ARIMA(rating6),
+        ets = ETS(rating6),
+        stl = STL(rating6 ~ trend(window=4), robust = TRUE), NAIVE(season_adjust))
+```
+
+```{r}
+fabletools::accuracy(fit_lviv)
+```
+
+```{r}
+fit_lviv %>% select(arima) %>% report()
+```
+
+```{r}
+fit_lviv %>% select(ets) %>% report()
+```
+## Залишки 
+
+```{r}
+gg_tsresiduals(fit_lviv %>% select(arima))
+```
+
+```{r}
+gg_tsresiduals(fit_lviv %>% select(ets))
+```
+
+```{r}
+gg_tsresiduals(fit_lviv %>% select(stl))
+```
+
+```{r}
+bank_ts_lviv %>%
+  model(arima = ARIMA(rating6)) %>%
+  forecast() %>%
+  autoplot(bank_ts_lviv)+ 
+  xlab("Час") + 
+  ylab("Рейтинг") + 
+  ggtitle('Прогнозовані значення рейтингу банку Львів stl')
+  
+```

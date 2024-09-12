@@ -1,0 +1,742 @@
+---
+title: "banks"
+format: html
+editor: visual
+---
+
+## Обробка даних
+
+# Імпортуємо потрібні бібліотеки
+
+```{r}
+#| warning: false
+#| message: false
+library(dplyr)
+library(tsibble)
+library(stringi)
+library(tidyverse)
+library(fpp3)
+library(GGally)
+library(factoextra)
+library(openxlsx)
+library(cluster)
+library(forecast)
+library(corrplot)
+```
+
+## Зчитуємо необхідний датасет
+
+```{r}
+banks<- readxl::read_xlsx('banks_new2.xlsx')
+```
+
+## Структура даних
+
+```{r}
+banks %>% 
+  glimpse()
+```
+
+В нашому наборі даних міститься `r nrow(banks)` спостережень та `r ncol(banks)` змінних.
+
+## Підготовка даних
+
+```{r}
+#| warning: false
+#| message: false
+remove <- c('АТ "БАНК СІЧ"', 'АТ "КБ "ЗЕМЕЛЬНИЙ КАПІТАЛ"', 'АТ "МЕГАБАНК"', 'АТ "МР БАНК" *', 'АТ "Місто Банк"', 'АТ "СБЕРБАНК"', 'АТ "УКРСОЦБАНК"', 'АТ АКБ "АРКАДА"', 'ПАТ "Промінвестбанк"', 'ПАТ "РОЗРАХУНКОВИЙ ЦЕНТР"')
+banks <- banks[!grepl(paste(remove, collapse = '|'), banks$name),]
+
+banks$group <- ifelse(grepl("з державною часткою", banks$group), "state",
+                      ifelse(grepl("іноземних банківських груп", banks$group), "foreign",
+                             ifelse(grepl("з приватним капіталом", banks$group), "privat", banks$group)))
+
+banks$name <- gsub(" ", "_", banks$name)
+banks$deposit_loans <- ifelse(is.na(banks$deposit_loans), 0, banks$deposit_loans)
+banks$rating6 <- banks$current_ratio+banks$capital_adequacy+banks$deposit_loans+banks$roa+banks$roe+banks$icr
+banks$date <- as.Date(banks$date)
+```
+
+### Створюємо датасет, в якому будуть міститься тільки коєфіцінти та рейтинг
+
+```{r}
+#| warning: false
+#| message: false
+banks_rating <- banks %>% select(date, name, group, current_ratio, capital_adequacy, deposit_loans, roa, roe, icr, rating6)
+
+```
+
+# Перетворення на часовий ряд
+
+```{r}
+banks_rating$date <- yearmonth(banks_rating$date)
+banks_rating_ts <- banks_rating %>% 
+  as_tsibble(index = date, key = name)
+banks_rating_ts
+
+```
+
+## Перевіримо наявність пропусків
+
+```{r}
+has_gaps(banks_rating_ts)
+```
+
+# Візуалізація
+
+```{r}
+#| warning: false
+#| message: false
+ggplot(data = banks_rating %>% filter(group == 'state'), aes(x = date, y = rating6)) +
+  geom_smooth(se = FALSE, colour = "lightblue") +
+  geom_line(colour = "blue") +
+  facet_wrap(vars(name), scales = "free") +
+  theme(legend.position = "none") +
+  labs(
+    title = "Рейтинг державних банків",
+    y = "Рейтинг",
+    x = "Дата"
+  )
+
+```
+
+```{r}
+#| warning: false
+#| message: false
+ggplot(data = banks_rating %>% filter(group == 'privat'), aes(x = date, y = rating6)) +
+  geom_smooth(se = FALSE, colour = "lightblue") +
+  geom_line(colour = "blue") +
+  facet_wrap(vars(name), scales = "free") +
+  theme(legend.position = "none") +
+  labs(
+    title = "Рейтинг приватних банків",
+    y = "Рейтинг",
+    x = "Дата"
+  )
+ggsave("privat_banks.png", width = 15, height = 15, dpi = 300)
+```
+
+```{r}
+#| warning: false
+#| message: false
+ggplot(data = banks_rating %>% filter(group == 'foreign'), aes(x = date, y = rating6)) +
+  geom_smooth(se = FALSE, colour = "lightblue") +
+  geom_line(colour = "blue") +
+  facet_wrap(vars(name), scales = "free") +
+  theme(legend.position = "none") +
+  labs(
+    title = "Рейтинг іноземних банків",
+    y = "Рейтинг",
+    x = "Дата"
+  )
+```
+
+### Візуалізація групування за формою власності
+
+```{r}
+banks_rating_ts %>%
+  group_by(group) %>%
+  summarise(
+    mean_volume = mean(rating6),
+    median_volume = median(rating6),
+    sd_volume = sd(rating6)
+  ) %>%
+  ggplot(aes(x = group, y = mean_volume)) +
+  geom_boxplot(aes(group = group)) +
+  facet_wrap(~ group, scales = "free") +
+  theme(legend.position = "none") +
+  labs(
+    title = "Рейтинг банків за формою власності",
+    y = "Середнє значення рейтингу",
+    x = "Форма власності"
+  )
+```
+
+Найбільш схожа на нормальний розподіл рейтинг надійності державних банків, адже медіана розподілу знаходиться майже посередині, коробка має симетричний вигляд, а викидів взагалі немаю. У розподілі банків з іноземною часткою та з приватним капіталом бачимо певні відмінності, тут вже присутні викиди, "коробка" знаходиться не по центру. А також у розподілі приватних банків можна помітити, що медіанні значення зміщені до низу коробки.
+
+В загальному, середнє значення рейтингу мають банки з приватною часткою, але це не свідчить про їх надійність. На це могли значно вплинути викиди(банки з аномальним рейтингом надійності, на який вплинуло високе відношення депозитів до кредитів).
+
+Будемо враховувати як максимально нормальне значення рейтингу банків - 7, інші - великі, а ті, що \> 50 - аномально великі.
+
+За допомогою boxplot можна побачити, як розподіляється рейтинг банків у кожній групі. Якщо відстань між верхньою та нижньою межами boxplot велика, то це означає, що значення рейтингу різняться досить суттєво. Якщо ж відстань мала, то значення рейтингу більш-менш однакові.
+
+Крім того, за допомогою середнього значення, медіани та стандартного відхилення можна порівняти рейтинг банків між різними формами власності та зробити висновки про те, які форми власності мають кращий рейтинг, а які гірший.
+
+## Аномальні значення
+
+```{r}
+outliers <- banks_rating_ts[, c ("date", "name", "group", "rating6")] %>% filter(rating6 > 50)
+outliers
+```
+
+Отже, найбільше виділились Альпарі банк, Банк Авангард та БТА банк.
+
+# Кластеризація для 01.01.2022 та 01.01.2023 років
+
+## Створюємо датасети з даними за 2021 та 2022 роки
+
+```{r}
+banks_rating_2023 <- banks_rating %>% filter(format(date, "%Y-%m-%d") == "2023-01-01")
+banks_rating_2023 %>% 
+  arrange(desc(rating6))
+banks_rating_2022 <- banks_rating %>% filter(format(date, "%Y-%m-%d") == "2022-01-01")
+banks_rating_2022 %>% 
+  arrange(desc(rating6))
+```
+
+
+
+```{r}
+main_text1 <- "Матриця діаграм розсіювання банків за 2021 рік"
+pairs(banks_rating_2022[4:10], main = main_text1)
+
+```
+
+-   Також потрібно звернути увагу на розподіл точок на кожному графіку. Це може дати інформацію про те, чи існують варіації взаємозв'язку між змінними для різних груп банків.
+
+-   Висновки з цього графіку можуть бути різними в залежності від аналізуваних змінних та конкретної ситуації на ринку. Наприклад, можна проаналізувати, чи існує залежність між рівнем капіталізації та рівнем ліквідності банків, чи яка взаємозв'язок між ризиками та рентабельністю діяльності банків тощо.
+
+-   Можна помітити лінійний зв'язок між ROA та ROE, тікож між значенням рейтингу та відношенням депозитів до кредитів(що логічно, адже саме через цей показник знаяення рейтингу багатьох банків виявилось аномально високим). Також бачимо щось схоже на лінійну залежність між ICR та адекватнісю капіталу.
+
+```{r}
+main_text2 <- "Матриця діаграм розсіювання банків за 2022 рік"
+pairs(banks_rating_2023[4:10], main = main_text2)
+```
+Аналогічна кртинка для результатів по 2022 року. Однак в даному випадку немає лінійної залежності між рейтингом та відношенням депозитів до кредитів.
+
+
+# Кореляційна матриця
+
+```{r}
+cor(banks_rating_2023[4:10]) %>% 
+corrplot(method = "circle")
+title("Кореляційна матриця 2022")
+
+cor(banks_rating_2022[4:10]) %>% 
+corrplot(method = "circle")
+title("Кореляційна матриця 2021")
+```
+
+За побудованими кореляційними матрицями можна помітити, що у 2021 році в загальному коефіцієнти мали тісніший зв'язок між собою.
+
+2021:
+- Прямий кореляційний зв'язок між рейтингом та відношенням депозитів до кредитів, що становить 1.
+- Між адекватністю капіталу та коефіцієнтом покриття також існує прямий зв'язок близько 0,8.
+- Великий зв'язок між рентабельністю активів та рентабельністю капіталів - 0.8
+- також можна помітити обернений зв'язок, що становить близько - 0.4 між рейтингом та roa(рентабельність активів), roa(рентабельність активів) та відношення депозитів до кредитів, roe(рентабельність капіталу) до адекватності капіталу (тобто чим більша адекватність капіталу, тим його рентабельність меньша)
+
+Дивним є те, що при зменшенні рентабельності капіталу та рентабельності активів значення рейтингу є більшим. Це треба враховувати при побудові рейтингу. Щоб на високі сходинки рейтингу не потрапили значення з дуже маленькими коефіцієнтами рентабельності.
+
+2022:
+- Прямий кореляційний зв'язок між рейтингом та відношенням депозитів до кредитів, що становить 1.
+- Між адекватністю капіталу та коефіцієнтом покриття також існує прямий зв'язок близько 0,8.
+- Помітний зв'язок між рентабельністю активів та рентабельністю капіталів - 0.7
+
+У 2022 році, на відміну від 2021 при збільшенні рейтингу усі коефіцієнти також збільшуються, як іі потрібно бути. Тому при побудові рейтингу треба буде врахувати тільки адекватність відношення депозитів до кредитів.
+
+# Кластеризація усіх банків
+```{r}
+
+distance_2022 <- dist(banks_rating_2022[, -c(1, 2, 3)])
+
+banks_rating_2022.hclust = hclust(distance_2022)
+plot(banks_rating_2022.hclust,hang=-1, banks_rating_2022$name,main='Ієрархічна кластеризація усіх банків 2021')
+
+
+distance_2023 <- dist(banks_rating_2023[, -c(1, 2, 3)])
+
+banks_rating_2023.hclust = hclust(distance_2023)
+
+plot(banks_rating_2023.hclust,hang=-1, banks_rating_2023$name,main='Ієрархічна кластеризація усіх банків 2022')
+```
+
+
+Деякі банки утворили отремі кластери через те, що рейтинг їх надійності виявився аномально великим, що відрізняється від загальноїї групи банків. Це викликано тим, що вони видавали набагато більше депозитів в порівнянні до кредитів.
+
+
+#### Рейтинг 2021
+Для рейтингування 2021 року треба взяти до уваги те, що деякі банки з високим значенням рейтингу мають від'ємне значення ROA та ROE (як було видно з кореляційної матриці). Тому при побудові рейтингу буде враховано те, що ТОП-5.
+```{r}
+banks_rating_2022 %>%
+  filter(roa>0, roe>0, rating6<8) %>% 
+  arrange(desc(rating6))
+```
+Лідер державних - АТ_КБ_"ПриватБанк"
+Лідер приватних - АТ_"БАНК_"ПОРТАЛ"
+Лідер іноземних - АТ_"СІТІБАНК"
+
+## Найгірші
+
+```{r}
+banks_rating_2022 %>%
+  arrange(desc(rating6)) %>% 
+  tail(20)
+```
+
+#### Рейтинг 2022
+
+```{r}
+banks_rating_2023 %>%
+  filter(roa>0, roe>0, rating6<8) %>% 
+  arrange(desc(rating6)) 
+```
+Лідер державних - АТ_"Ощадбанк"
+Лідер приватних - АТ_"БАНК_"ПОРТАЛ"
+Лідер іноземних - АТ_"УКРСИББАНК"
+
+## Найгірші
+
+```{r}
+banks_rating_2023 %>%
+  arrange(desc(rating6)) %>% 
+  tail(5)
+```
+roa, roe в основному менше 0
+
+### Створення окремих кластерів для аномальних значень
+
+```{r}
+anomaly_cluster_2023 <- banks_rating_2023 %>%
+  filter(rating6 > 7) %>%
+  mutate(cluster = "Anomaly") %>% 
+  select(-date,-group) %>%
+  column_to_rownames(var = "name")
+
+anomaly_cluster_2022 <- banks_rating_2022 %>%
+  filter(rating6 > 7) %>%
+  mutate(cluster = "Anomaly") %>% 
+  select(-date,-group) %>%
+  column_to_rownames(var = "name")
+```
+
+### Кластеризація інших банків
+
+#### Нові датасети
+
+```{r}
+banks_cl_2023 <- banks_rating_2023 %>%
+  filter(rating6 <= 7) %>% 
+  select(-date,-group) %>%
+  column_to_rownames(var = "name")
+
+banks_cl_2022 <- banks_rating_2022 %>%
+  filter(rating6 <= 7) %>% 
+  select(-date,-group) %>%
+  column_to_rownames(var = "name")
+```
+
+#### Матриця дистанцій
+
+```{r}
+res.dist_2023 <- get_dist(banks_cl_2023, method = "euclidean")
+head(round(as.matrix(res.dist_2023), 2))[, 1:6]
+
+res.dist_2022 <- get_dist(banks_cl_2022, method = "euclidean")
+head(round(as.matrix(res.dist_2022), 2))[, 1:6]
+```
+
+```{r}
+fviz_dist(res.dist_2023, lab_size = 8) + ggtitle("Результати дистанційної матриці 2022")
+ggsave("дист_матр_2022.png", width = 15, height = 15, dpi = 300)
+
+fviz_dist(res.dist_2022, lab_size = 8) + ggtitle("Результати дистанційної матриці 2021")
+ggsave("дист_матр_2021.png", width = 15, height = 15, dpi = 300)
+
+```
+
+Рожевий колір відповідає високому значенню дистанції між банками, синій - банки більш схожі один на одний. Ймовірно, що ті банки на перетині яких синій колір попадуть в один кластер.
+
+## Ієрархічна кластеризація
+
+```{r}
+# Compute hierarchical clustering
+res.hc_2023 <- hclust(res.dist_2023, method = "ward.D2")
+
+# Compute hierarchical clustering
+res.hc_2022 <- hclust(res.dist_2022, method = "ward.D2")
+
+# Visualize
+fviz_dend(res.hc_2022, k = 3, cex = 0.4,lwd = 1, color_labels_by_k = TRUE, main = "Iерархічна кластеризація 2021 року" )
+ggsave("dendrogram_2022.png", width = 10, height = 15, dpi = 300)
+fviz_dend(res.hc_2022, cex = 0.6, k = 3, type = "circular", rect = TRUE, main = "Iерархічна кластеризація 2021 року" )
+ggsave("circular_2021.png", width = 10, height = 10, dpi = 300)
+
+fviz_dend(res.hc_2023, k = 3,cex = 0.4,lwd = 1, color_labels_by_k = TRUE, main = "Iерархічна кластеризація 2022 року")
+ggsave("dendrogram_2023.png", width = 10, height = 15, dpi = 300)
+fviz_dend(res.hc_2023, cex = 0.6, k = 3, type = "circular", rect = TRUE, main = "Iерархічна кластеризація 2022 року" )
+ggsave("circular_2022.png", width = 10, height = 10, dpi = 300)
+```
+## Кластеризація методом к-середніх
+```{r}
+res.km_2023 <- eclust(banks_cl_2023, "kmeans", nstart = 25)
+fviz_cluster(res.km_2023, data = banks_cl_2023, geom = "point", frame.type = "norm") +
+  ggtitle("Кластеризація k-means 2022")
+
+res.km_2022 <- eclust(banks_cl_2022, "kmeans", k = 3, nstart = 25)
+fviz_cluster(res.km_2022, data = banks_cl_2022, geom = "point", frame.type = "norm") +
+  ggtitle("Кластеризація k-means 2021")
+
+```
+
+### Визначення оптимального значення кластеру
+
+```{r}
+fviz_gap_stat(res.km_2023$gap_stat)+
+  ggtitle("Оптимальна кількість кластерів")
+
+```
+Gap Statistic враховує відхилення середнього логарифмічного внутрішньокластерного розбіжності з мінімальною відхиленням від нуля у порівнянні з тим, що можна очікувати в випадкових даних без структури кластерів. Зазвичай, ми шукаємо число кластерів, при якому зменшення внутрішньокластерної розбіжності змінюється не так сильно і показує максимальне значення відносно порівняння з відхиленням, яке було спостережене у випадкових даних.
+
+У візуалізації результатів, fviz_gap_stat() показує значення Gap Statistic на вертикальній осі, а на горизонтальній осі відображається кількість кластерів. Зазвичай, ми шукаємо значення кількості кластерів, для якого значення Gap Statistic починає зменшуватися повільно або зафіксовується на максимальному рівні.
+
+```{r}
+fviz_silhouette(res.km_2023, main = "Графік силуетів кластерів 2022")
+fviz_silhouette(res.km_2022, main = "Графік силуетів кластерів 2021")
+```
+
+Силуетна діаграма дозволяє оцінити, наскільки кожен об'єкт у кластері схожий на інші об'єкти у своєму кластері в порівнянні з об'єктами в інших кластерах. Кожен стовпець у діаграмі відповідає одному об'єкту, і його висота відображає, наскільки цей об'єкт "схожий" на інші об'єкти у своєму кластері в порівнянні з об'єктами в інших кластерах. Чим більший силуетний коефіцієнт, тим краще якість кластеризації, оскільки це означає, що об'єкт належить до свого власного кластеру більше, ніж до будь-якого іншого кластеру.
+
+Для 2022 року
+
+Кластер 1: містить 11 об'єктів і має середню ширину силуету 0.34, що означає низький рівень подібності між об'єктами в цьому кластері. Кластер 2: містить 29 об'єктів і має середню ширину силуету 0.49, що означає помірний рівень подібності між об'єктами в цьому кластері. Кластер 3: містить 12 об'єктів і має середню ширину силуету 0.53, що означає високий рівень подібності між об'єктами в цьому кластері.
+
+Загалом, ці результати показують, що кластеризація працює краще для кластеру 3, але не дуже добре для кластерів 1 та 2.
+
+## Результати кластеризації:
+
+### 2022
+
+```{r}
+res.km_2023
+```
+
+```{r}
+banks_cl_2023_ready <- cbind(banks_cl_2023, cluster = res.km_2023$cluster)
+banks_cl_2023_ready <- rbind(banks_cl_2023_ready, anomaly_cluster_2023)
+banks_cl_2023_ready$cluster <- ifelse(grepl("1", banks_cl_2023_ready$cluster), "low",
+                      ifelse(grepl("2", banks_cl_2023_ready$cluster), "medium",
+                             ifelse(grepl("3", banks_cl_2023_ready$cluster), "high", banks_cl_2023_ready$cluster)))
+```
+
+```{r}
+high <- banks_cl_2023_ready[,7:8] %>% 
+  filter(cluster == "high") %>% 
+  arrange(desc(rating6))
+```
+
+
+### 2021
+
+```{r}
+res.km_2022
+```
+
+Cluster means це середнє значення кожного з ознак (current_ratio, capital_adequacy, deposit_loans, roa, roe, icr, rating6) для кожного з кластерів, що були сформовані в результаті кластеризації. Наприклад, для кластера 1 середнє значення ознаки рейтингу становить 3.897300(банки середньї надійності), для кластера 2 - 3.033314(найменшої надійності), а для кластера 3 - 5.510492(найбільш надійні).
+
+```{r}
+banks_cl_2022_ready <- cbind(banks_cl_2022, cluster = res.km_2022$cluster)
+banks_cl_2022_ready <- rbind(banks_cl_2022_ready, anomaly_cluster_2022)
+banks_cl_2022_ready$cluster <- ifelse(grepl("1", banks_cl_2022_ready$cluster), "medium",
+                      ifelse(grepl("2", banks_cl_2022_ready$cluster), "low",
+                             ifelse(grepl("3", banks_cl_2022_ready$cluster), "high", banks_cl_2022_ready$cluster)))
+
+head(banks_cl_2022_ready)
+```
+
+
+# ARIMA
+
+Побудуємо аріма моделі для державного банку АТ_КБ\_"ПриватБанк", що входив до аномального кластеру через велике значення надійності та для банку з іноземним капіталом АТ\_"Райффайзен_Банк", що входив до середнього кластеру надійності.
+
+Для побудові моделей дані необхідно перевести у стаціонарний вигляд(постійна дисперсія, відсутність сезонності)
+
+Стаціонарний ряд - постійне мат сподівання, постійна дисперсія, постійна коваріація. І - інтегрування - відповідає за приведення до стаціонарності
+
+## Візуалізація
+
+```{r}
+#| warning: false
+#| message: false
+ggplot(data = banks_rating_ts %>% filter(name == 'АТ_КБ_"ПриватБанк"'), aes(x = date, y = rating6)) +
+  geom_smooth(se = FALSE, colour = "lightblue") +
+  geom_line(colour = "blue") +
+  facet_wrap(vars(name), scales = "free") +
+  theme(legend.position = "none") +
+  labs(
+    title = "Рейтинг Приват банку"
+  )
+```
+
+Ряд не дуже схожий на стаціонарний, дисперсія є не дуже постійною, присутні різкі коливання
+```{r}
+#| warning: false
+#| message: false
+ggplot(data = banks_rating_ts %>% filter(name == 'АТ_"Райффайзен_Банк"'), aes(x = date, y = rating6)) +
+  geom_smooth(se = FALSE, colour = "lightblue") +
+  geom_line(colour = "blue") +
+  facet_wrap(vars(name), scales = "free") +
+  theme(legend.position = "none") +
+  labs(
+    title = "Рейтинг Райффайзен Банку"
+  )
+```
+
+У двох випадках дисперсія є непостійною, присутні коливання з часом, не схожі на білий шум. Бачимо для Приват банку зростаючий тренд, можливо присутня сезонність для двох банків.
+
+
+
+# Графік кореляцій
+
+```{r}
+banks_rating_ts %>% 
+  filter(name == 'АТ_КБ_"ПриватБанк"') %>% 
+  ACF(rating6, lag_max = 21) %>%
+  autoplot() +
+  labs(
+    title = "Корелограма автокореляції ПриватБанк"
+  )
+```
+
+Автокреляції не виходять за межі довірчих інтервалів, отже ряд схожий на білий шум. Ймовірно не треба проводити диференціювання
+
+```{r}
+bank_ts_priv <- banks_rating_ts%>% 
+  select(date, name, rating6) %>% 
+  filter(name == 'АТ_КБ_"ПриватБанк"')
+```
+## kpss тест
+
+```{r}
+bank_ts_priv %>%
+  features(rating6, unitroot_kpss)
+```
+
+pvalue = 0,1 \> 0,05, тобто дані є стаціонарними та несезонними
+
+```{r}
+bank_ts_priv %>%
+  features(rating6, unitroot_ndiffs)
+```
+Так як дані виявились стаціонарними. За результатом KPSS тесту не потрібно використовувати ряд різниць
+
+```{r}
+bank_ts_priv %>% ACF(difference(rating6)) %>% autoplot() + labs(
+    title = "Автокореляція перших різниць")
+```
+# Бокс-кокс
+Допомогає зробити математичні перетворення часових рядів більш гнучкими. Задача в тому, щоб підібрати оптимальне значення лямбди. Чим менше дисперсія часового ряду, тим більш підходящою є лямбда.
+
+```{r}
+bank_ts_priv %>%
+  features(rating6, features = guerrero)
+```
+Саме це значення Лямбда буде оптимальним та буде врівноважувати сезонні коливання та випадкові міни у часовому ряді.
+
+```{r}
+bank_ts_priv %>% autoplot(box_cox(rating6, -0.8999268)) +
+  labs(y = "Box-Cox transformed rating6")+
+  geom_smooth(se=FALSE, colour="blue")
+```
+
+Суттєвих змін у графіку рейтингування ПриватБанку не відбудося після застосування тесту Бокса Кокса. Можна помітити тільки, що значення розмірності рейтингу зменшились. Але, на мою думку, це не зробило часовий ряд кращим для прогнозування. Навпаки інтерпритація даних тепер стала складнішою. Тому я вважаю, що використовувати тест Бокса Кокса недоцільно.
+
+# Декомпозиція часовового ряду
+
+```{r}
+dcmp_priv <- bank_ts_priv %>%
+  model(stl = STL(rating6))
+components(dcmp_priv)
+```
+
+STL-модель розклала часовий ряд на тренд, річну сезонність, залишки та сезонно скоригований ряд
+
+```{r}
+components(dcmp_priv) %>% gg_subseries(season_year)
+```
+Очевидно за STL декомпозицією присутня певна сезонність. Тобто у квітні кожного року значення рейтингу найменше, потім воно поступово починає рости і до січня набиріє максимальних результатів.
+
+# Графік сезонності
+
+```{r}
+banks_rating_ts %>% 
+  filter(name == 'АТ_КБ_"ПриватБанк"') %>% 
+  gg_season(rating6, labels = "both") +
+  labs(
+    title = "Сезонність ПриватБанк"
+  )
+```
+
+Кожного разу рейтинг Приват Банку трохи падав до квітня кожного року, але потім знову починав рости і до кінця року ставав навіть бішим, ніж на початку. Щодо зміни значення рейтингу Приват Банку на початку 2022 та на початку 2023 року, можна помітити, що воно стало навіть більше. Тобто це свідчить про те, що війна не вплинула негативно на надійність Приват Банку.
+
+```{r}
+bank_ts_priv %>%
+  model(STL(rating6, robust=TRUE)) %>%
+  components() %>% autoplot() +
+    labs(title = "STL decomposition: ПриватБанк rating")
+```
+```{r}
+bank_train_priv <- bank_ts_priv %>% filter_index(. ~ "2022 Q1")
+```
+
+```{r}
+fit_priv <- bank_train_priv %>% 
+  model(arima = ARIMA(rating6~date),
+        ets = ETS(rating6),
+        stl = decomposition_model(STL(rating6 ~ trend(window=4), robust = TRUE), NAIVE(season_adjust)))
+```
+
+```{r}
+# Extract the predictions
+pred_priv <- fit_priv %>%
+  predict(bank_train_priv)
+
+# Extract the true values
+true_priv <- bank_train_priv$rating6
+
+# Compute accuracy measures
+accuracy_arima <- accuracy(pred_priv$arima, true_priv)
+accuracy_ets <- accuracy(pred_priv$ets, true_priv)
+accuracy_stl <- accuracy(pred_priv$stl, true_priv)
+
+# Print the accuracy measures
+print(accuracy_arima)
+print(accuracy_ets)
+print(accuracy_stl)
+```
+
+```{r}
+accuracy(fit_priv)
+```
+
+```{r}
+priv_fc <- fit_priv %>% 
+  select(ets) %>% 
+  forecast(h=4)
+```
+
+```{r}
+accuracy(priv_fc, bank_ts_priv)
+```
+
+
+```{r}
+fit_priv %>% select(arima) %>% report()
+```
+
+```{r}
+fit_priv %>% select(ets) %>% report()
+```
+
+```{r}
+gg_tsresiduals(fit_priv %>% select(arima))
+```
+Маємо графік залишків, корелограму автокореляції та розподіл залишків.
+В цілому залишки виглядають як білий шум, підрядковуються нормальному розподілу. Тому Це може свідчити про те, що вони сильно не впливають на модель та її можна використовувати для прогнозування.
+```{r}
+gg_tsresiduals(fit_priv %>% select(ets))
+```
+
+Також гарна картинка. Автокореляція трохи менша. 
+
+```{r}
+gg_tsresiduals(fit_priv %>% select(stl))
+```
+
+```{r}
+fit_priv %>%
+  select(ets) %>% 
+  forecast(h = 4) %>% 
+  autoplot(bank_ts_priv)
+```
+
+
+```{r}
+arima_model_priv <- auto.arima(bank_train_priv$rating6)
+summary(arima_model_priv)
+```
+
+Найкраще для даного часового ряду буде працювати авторегресійна модель другого порядку.
+
+$$ y_{t} = 0,82y_{y-1}-0,5y_{y-2}+\varepsilon _{t}$$, де $\varepsilon _{t}$ - це білий шум зі стандартним відхиленням $\sqrt{0,2067}=0,45$
+
+Інформаційний критерій достатньо маленький, що вказує на те, що модель непогана, але для Райфайзен банку модель спрацювала краще, адже там вони від'ємні
+
+```{r}
+forecast_values_priv <- forecast(arima_model_priv, h = 4)
+```
+
+```{r}
+autoplot(forecast_values_priv) + 
+  xlab("Час") + 
+  ylab("Рейтинг") + 
+  ggtitle('Прогнозовані значення рейтингу АТ_КБ_"ПриватБанк"')
+```
+
+```{r}
+banks_rating_ts %>% 
+  filter(name == 'АТ_"Райффайзен_Банк"') %>% 
+  ACF(rating6, lag_max = 21) %>%
+  autoplot() +
+  labs(
+    title = "Корелограма автокореляції Райффайзен Банк"
+  )
+```
+
+Автокореляція відсутня
+
+```{r}
+bank_ts_raif <- banks_rating_ts %>% 
+  filter(name == 'АТ_"Райффайзен_Банк"')
+
+```
+
+## kpss тест
+
+```{r}
+bank_ts_raif %>%
+  features(rating6, unitroot_kpss)
+```
+
+pvalue = 0,1 \> 0,05, тобто дані є стаціонарними та несезонними
+
+```{r}
+bank_ts_raif %>%
+  features(rating6, unitroot_ndiffs)
+```
+Так як дані виявились стаціонарними. За результатом KPSS тесту не потрібно використовувати ряд різниць
+
+# Сезонність
+
+```{r}
+banks_rating_ts %>% 
+  filter(name == 'АТ_"Райффайзен_Банк"') %>% 
+  gg_season(rating6, labels = "both") +
+  labs(
+    title = "Сезонність Райффайзен Банк"
+  )
+```
+
+Також присутня сезонність
+```{r}
+arima_model_raif <- auto.arima(bank_ts_raif$rating6)
+summary(arima_model_raif)
+```
+
+Найкраще для даного часового ряду буде працювати авторегресійна модель першого порядку.
+
+$$ y_{t} = 0,53y_{y-1}+\varepsilon _{t}$$, де $\varepsilon _{t}$ - це білий шум зі стандартним відхиленням $\sqrt{0.04271}=0,207$
+
+Інформаційні критерії(Акайке та Байсовий) дуже маленькі та навіть приймають від'ємні значення, що вказує на те, що модель дуже хороша.
+
+```{r}
+forecast_values_raif <- forecast(arima_model_raif, h = 12)
+```
+
+```{r}
+autoplot(forecast_values_raif) + 
+  xlab("Час") + 
+  ylab("Рейтинг") + 
+  ggtitle("Прогнозовані значення рейтингу АТ \"Райффайзен Банк\"")
+```
+
+
